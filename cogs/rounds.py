@@ -50,6 +50,45 @@ class VCPickerView(discord.ui.View):
         await interaction.response.defer()
 
 
+class EventNameModal(discord.ui.Modal, title="Name your event"):
+    event_name = discord.ui.TextInput(
+        label="Event name",
+        placeholder="Song Wars Round 1",
+        default="Song Wars",
+        max_length=100,
+    )
+
+    def __init__(self, view: "StageEventConfirmView | None" = None):
+        super().__init__()
+        self.parent_view = view
+        self.submitted_name = None
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.submitted_name = self.event_name.value.strip() or "Song Wars"
+        if self.parent_view:
+            self.parent_view.event_name = self.submitted_name
+            self.parent_view.create_event = True
+            self.parent_view.stop()
+        await interaction.response.defer()
+
+
+class StageEventConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.create_event = False
+        self.event_name = None
+
+    @discord.ui.button(label="Yes, create a stage event", style=discord.ButtonStyle.success)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(EventNameModal(self))
+
+    @discord.ui.button(label="No, just use the channel", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.create_event = False
+        self.stop()
+        await interaction.response.defer()
+
+
 async def get_submissions_channel(guild: discord.Guild) -> discord.TextChannel | None:
     settings = await db.get_guild_settings(guild.id)
     if not settings or not settings.get("submissions_channel_id"):
@@ -151,14 +190,86 @@ class Rounds(commands.Cog):
 
         await vc_view.wait()
 
+        event_name = "Song Wars"
+
         if vc_view.create_new:
+            # Ask for event name via modal before creating
+            name_modal = EventNameModal()
+            name_view = discord.ui.View(timeout=120)
+
+            class NameTriggerView(discord.ui.View):
+                def __init__(self):
+                    super().__init__(timeout=120)
+                    self.submitted_name = None
+
+                @discord.ui.button(label="Set event name", style=discord.ButtonStyle.primary)
+                async def set_name(self, inter: discord.Interaction, button: discord.ui.Button):
+                    modal = EventNameModal()
+                    await inter.response.send_modal(modal)
+                    await modal.wait()
+                    self.submitted_name = modal.submitted_name
+                    self.stop()
+
+            name_trigger = NameTriggerView()
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    description="What should the stage event be called?",
+                    color=C_INFO,
+                ),
+                view=name_trigger
+            )
+            await name_trigger.wait()
+            event_name = name_trigger.submitted_name or "Song Wars"
+
             try:
-                event_channel = await interaction.guild.create_stage_channel("Song Wars Stage")
+                event_channel = await interaction.guild.create_stage_channel(event_name)
             except discord.Forbidden:
-                await interaction.followup.send(embed=e_error("I don't have permission to create a stage channel."))
+                await interaction.followup.send(embed=e_error("I don't have permission to create a stage channel. Make sure community mode is enabled in your server."))
                 return
+            except discord.HTTPException:
+                await interaction.followup.send(embed=e_error("Could not create a stage channel. Make sure your server has community mode enabled."))
+                return
+
+            # Create the stage event
+            try:
+                import datetime
+                await interaction.guild.create_scheduled_event(
+                    name=event_name,
+                    channel=event_channel,
+                    start_time=discord.utils.utcnow() + datetime.timedelta(minutes=1),
+                    entity_type=discord.EntityType.stage_instance,
+                    privacy_level=discord.PrivacyLevel.guild_only,
+                )
+            except Exception:
+                pass  # Event creation failing shouldn't block the round
+
         elif vc_view.selected_channel:
             event_channel = vc_view.selected_channel
+
+            # Ask if they want to create a stage event for this channel
+            confirm_view = StageEventConfirmView()
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    description=f"Do you want to create a stage event for {event_channel.mention}?",
+                    color=C_INFO,
+                ),
+                view=confirm_view
+            )
+            await confirm_view.wait()
+
+            if confirm_view.create_event and confirm_view.event_name:
+                event_name = confirm_view.event_name
+                try:
+                    import datetime
+                    await interaction.guild.create_scheduled_event(
+                        name=event_name,
+                        channel=event_channel,
+                        start_time=discord.utils.utcnow() + datetime.timedelta(minutes=1),
+                        entity_type=discord.EntityType.stage_instance,
+                        privacy_level=discord.PrivacyLevel.guild_only,
+                    )
+                except Exception:
+                    pass
         else:
             await interaction.followup.send(embed=e_error("No channel selected. Run `/startround` again."))
             return
