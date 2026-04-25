@@ -3,11 +3,14 @@ import hmac
 import hashlib
 import anthropic
 import discord
+import logging
 from discord.ext import commands
 from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger("songwars")
 
 BOT_UPDATES_CHANNEL_ID = int(os.getenv("BOT_UPDATES_CHANNEL_ID", 0))
 BOT_UPDATES_ROLE_ID    = int(os.getenv("BOT_UPDATES_ROLE_ID", 0))
@@ -48,7 +51,7 @@ File changes:
 {commit_text}"""
 
     message = await anthropic_client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-haiku-4-5-20251001",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}]
     )
@@ -67,43 +70,53 @@ class GitHub(commands.Cog):
         await self.runner.setup()
         site = web.TCPSite(self.runner, "0.0.0.0", WEBHOOK_PORT)
         await site.start()
-        print(f"GitHub webhook server running on port {WEBHOOK_PORT}")
+        log.info(f"GitHub webhook server running on port {WEBHOOK_PORT}")
 
     async def handle_webhook(self, request: web.Request) -> web.Response:
-        payload = await request.read()
-        sig = request.headers.get("X-Hub-Signature-256", "")
+        try:
+            payload = await request.read()
+            sig = request.headers.get("X-Hub-Signature-256", "")
 
-        if not verify_signature(payload, sig):
-            return web.Response(status=401, text="Invalid signature")
+            if not verify_signature(payload, sig):
+                return web.Response(status=401, text="Invalid signature")
 
-        event = request.headers.get("X-GitHub-Event", "")
-        if event != "push":
-            return web.Response(text="ok")
+            event = request.headers.get("X-GitHub-Event", "")
+            if event != "push":
+                return web.Response(text="ok")
 
-        data = await request.json()
-        commits = data.get("commits", [])
-        if not commits:
-            return web.Response(text="ok")
+            data = await request.json()
+            commits = data.get("commits", [])
+            if not commits:
+                return web.Response(text="ok")
 
-        # Check if any actual files were changed
-        any_changes = any(
-            c.get("added") or c.get("modified") or c.get("removed")
-            for c in commits
-        )
-        if not any_changes:
-            return web.Response(text="ok")
+            any_changes = any(
+                c.get("added") or c.get("modified") or c.get("removed")
+                for c in commits
+            )
+            if not any_changes:
+                log.info("GitHub push had no file changes, skipping.")
+                return web.Response(text="ok")
 
-        summary = await summarize_with_claude(commits)
+            log.info(f"Processing {len(commits)} commit(s) from GitHub.")
+            summary = await summarize_with_claude(commits)
+            log.info(f"Summary generated: {summary[:60]}...")
 
-        channel = self.bot.get_channel(BOT_UPDATES_CHANNEL_ID)
-        if channel:
+            channel = self.bot.get_channel(BOT_UPDATES_CHANNEL_ID)
+            if not channel:
+                log.error(f"Could not find bot updates channel {BOT_UPDATES_CHANNEL_ID}")
+                return web.Response(text="ok")
+
             embed = discord.Embed(
                 title="bot update",
                 description=f"```{summary}```",
                 color=0x5865F2,
             )
-            await channel.send(content=f"<@&{BOT_UPDATES_ROLE_ID}>")
-            await channel.send(embed=embed)
+            await channel.send(content=f"<@&{BOT_UPDATES_ROLE_ID}>", embed=embed)
+            log.info("Bot update posted to Discord.")
+
+        except Exception as e:
+            log.exception(f"Error handling GitHub webhook: {e}")
+            return web.Response(status=500, text="Internal server error")
 
         return web.Response(text="ok")
 
