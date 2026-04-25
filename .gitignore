@@ -1,0 +1,5 @@
+.env
+songwars.db
+__pycache__/
+*.pyc
+*.pyo
