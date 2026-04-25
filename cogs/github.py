@@ -24,7 +24,7 @@ anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 def verify_signature(payload: bytes, sig_header: str) -> bool:
     if not GITHUB_WEBHOOK_SECRET:
         return True
-    expected = "sha256=" + hmac.new(GITHUB_WEBHOOK_SECRET, payload, hashlib.sha256).hexdigest()
+    expected = "sha256=" + hmac.HMAC(GITHUB_WEBHOOK_SECRET, payload, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig_header or "")
 
 
