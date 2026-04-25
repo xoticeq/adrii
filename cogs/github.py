@@ -110,7 +110,7 @@ class GitHub(commands.Cog):
             if not channel:
                 log.error(f"Could not find bot updates channel {BOT_UPDATES_CHANNEL_ID}")
                 return web.Response(text="ok")
-
+#edit
             embed = discord.Embed(
                 title="bot update",
                 description=f"```{summary}```",
