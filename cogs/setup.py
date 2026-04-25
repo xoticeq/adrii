@@ -482,7 +482,7 @@ class Setup(commands.Cog):
                 new_updates = updates_view.selected_channel
             else:
                 new_updates = None
-
+# test
             await db.save_guild_settings(
                 interaction.guild.id,
                 settings["submissions_channel_id"],
