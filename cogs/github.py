@@ -84,7 +84,12 @@ class GitHub(commands.Cog):
             if event != "push":
                 return web.Response(text="ok")
 
-            data = await request.json()
+            import json
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                log.error("Failed to parse GitHub payload as JSON")
+                return web.Response(status=400, text="Bad request")
             commits = data.get("commits", [])
             if not commits:
                 return web.Response(text="ok")
@@ -105,7 +110,7 @@ class GitHub(commands.Cog):
             if not channel:
                 log.error(f"Could not find bot updates channel {BOT_UPDATES_CHANNEL_ID}")
                 return web.Response(text="ok")
-# adding things
+
             embed = discord.Embed(
                 title="bot update",
                 description=f"```{summary}```",
