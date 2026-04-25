@@ -6,12 +6,17 @@ from state import state
 ALLOWED_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 MAX_FILE_MB = 25
 
-# ── Color palette ─────────────────────────────────────────────────────────────
-C_INFO    = 0x5865F2  # blurple  neutral/informational
-C_SUCCESS = 0x57F287  # green    success/complete
-C_ERROR   = 0xED4245  # red      errors/rejections
-C_GOLD    = 0xFFD700  # gold     final results/winners
-C_ORANGE  = 0xFF6B35  # orange   tournament/matchups
+# ── Default colors ────────────────────────────────────────────────────────────
+C_INFO    = 0x5865F2
+C_SUCCESS = 0x57F287
+C_ERROR   = 0xED4245
+C_GOLD    = 0xFFD700
+C_ORANGE  = 0xFF6B35
+
+
+async def guild_color(guild_id: int) -> int:
+    """Returns the guild's custom color, or blurple as default."""
+    return await db.get_guild_color(guild_id)
 
 
 # ── Embed helpers ─────────────────────────────────────────────────────────────

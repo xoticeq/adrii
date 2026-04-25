@@ -64,7 +64,8 @@ async def init_db():
                 submissions_channel_id INTEGER,
                 bot_updates_channel_id INTEGER,
                 host_role_ids TEXT DEFAULT '[]',
-                setup_complete INTEGER DEFAULT 0
+                setup_complete INTEGER DEFAULT 0,
+                embed_color INTEGER
             );
         """)
         await db.commit()
@@ -368,4 +369,26 @@ async def save_guild_settings(guild_id: int, submissions_channel_id: int, host_r
                 host_role_ids = excluded.host_role_ids,
                 setup_complete = 1
         """, (guild_id, submissions_channel_id, bot_updates_channel_id, json.dumps(host_role_ids)))
+        await db.commit()
+
+
+
+async def get_guild_color(guild_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT embed_color FROM guild_settings WHERE guild_id = ?", (guild_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] is None:
+                return 0x5865F2  # default blurple
+            return row[0]
+
+
+async def set_guild_color(guild_id: int, color: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO guild_settings (guild_id, embed_color)
+            VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET embed_color = excluded.embed_color
+        """, (guild_id, color))
         await db.commit()
