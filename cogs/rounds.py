@@ -16,18 +16,56 @@ from utils import (
 
 load_dotenv()
 
-GUILD_ID            = int(os.getenv("GUILD_ID", 0))
-SUBMISSIONS_CHANNEL = int(os.getenv("SUBMISSIONS_CHANNEL_ID", 0))
-EVENT_VC_ID         = int(os.getenv("EVENT_VC_ID", 0))
-ADMIN_ROLE_ID       = int(os.getenv("ADMIN_ROLE_ID", 0))
-HOST_ROLE_ID        = int(os.getenv("HOST_ROLE_ID", 0))
-OWNER_ID            = int(os.getenv("OWNER_ID", 0))
-
+GUILD_ID  = int(os.getenv("GUILD_ID", 0))
 guild_obj = discord.Object(id=GUILD_ID)
 
 
+class VCPickerView(discord.ui.View):
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.selected_channel = None
+        self.create_new = False
+
+        voice_channels = [c for c in guild.channels if isinstance(c, (discord.VoiceChannel, discord.StageChannel))]
+        options = [
+            discord.SelectOption(label=f"{('#' if isinstance(c, discord.StageChannel) else '') }{c.name}", value=str(c.id))
+            for c in voice_channels[:25]
+        ]
+
+        if options:
+            select = discord.ui.Select(placeholder="Pick an existing channel...", options=options)
+            select.callback = self.on_select
+            self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_channel = interaction.guild.get_channel(int(interaction.data["values"][0]))
+        self.stop()
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Create a stage channel for me", style=discord.ButtonStyle.secondary)
+    async def create_stage(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.create_new = True
+        self.stop()
+        await interaction.response.defer()
+
+
+async def get_submissions_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    settings = await db.get_guild_settings(guild.id)
+    if not settings or not settings.get("submissions_channel_id"):
+        return None
+    return guild.get_channel(settings["submissions_channel_id"])
+
+
+async def get_host_role_ids(guild_id: int) -> list[int]:
+    settings = await db.get_guild_settings(guild_id)
+    if not settings:
+        return []
+    return settings.get("host_role_ids", [])
+
+
 async def post_final_result(guild: discord.Guild, submission: dict, scores: list[dict]):
-    channel = guild.get_channel(SUBMISSIONS_CHANNEL)
+    channel = await get_submissions_channel(guild)
     if not channel:
         return
 
@@ -40,7 +78,6 @@ async def post_final_result(guild: discord.Guild, submission: dict, scores: list
         description=f"**Artist:** {ping}\n**Track:** `{submission['filename']}`",
         color=C_GOLD,
     )
-
     lines = ""
     for s in scores:
         judge = guild.get_member(s["judge_id"])
@@ -56,17 +93,23 @@ class Rounds(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    def is_host(self, interaction: discord.Interaction) -> bool:
-        return any(r.id in (HOST_ROLE_ID, ADMIN_ROLE_ID) for r in interaction.user.roles)
+    async def is_host(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == interaction.guild.owner_id:
+            return True
+        host_ids = await get_host_role_ids(interaction.guild.id)
+        return any(r.id in host_ids for r in interaction.user.roles)
 
-    def is_owner(self, ctx: commands.Context) -> bool:
-        return ctx.author.id == OWNER_ID or any(r.id == HOST_ROLE_ID for r in ctx.author.roles)
+    async def is_host_ctx(self, ctx: commands.Context) -> bool:
+        if ctx.author.id == ctx.guild.owner_id:
+            return True
+        host_ids = await get_host_role_ids(ctx.guild.id)
+        return any(r.id in host_ids for r in ctx.author.roles)
 
     # ── !judges ───────────────────────────────────────────────────────────────
 
     @commands.command(name="judges")
     async def set_judges(self, ctx: commands.Context, *members: discord.Member):
-        if not self.is_owner(ctx):
+        if not await self.is_host_ctx(ctx):
             await ctx.send(embed=e_error("Only the server owner or a host can set judges."), delete_after=5)
             return
         event = await db.get_active_event(ctx.guild.id)
@@ -82,34 +125,67 @@ class Rounds(commands.Cog):
     @app_commands.command(name="startround", description="Open a new round for submissions.")
     @app_commands.guilds(guild_obj)
     async def startround(self, interaction: discord.Interaction):
-        if not self.is_host(interaction):
+        if not await self.is_host(interaction):
             await interaction.response.send_message(embed=e_error("Hosts only."))
             return
+
+        settings = await db.get_guild_settings(interaction.guild.id)
+        if not settings or not settings.get("setup_complete"):
+            await interaction.response.send_message(embed=e_error("Run `/setup` first before starting a round."))
+            return
+
         if await db.get_active_event(interaction.guild.id):
             await interaction.response.send_message(embed=e_error("A round is already open."))
             return
 
-        await db.create_event(interaction.guild.id, "Song Wars Round", "standard")
+        # Ask which VC to use
+        vc_view = VCPickerView(interaction.guild)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="Starting a Round: Event Channel",
+                description="Pick a voice or stage channel for the event, or let the bot create a stage.",
+                color=C_INFO,
+            ),
+            view=vc_view
+        )
+
+        await vc_view.wait()
+
+        if vc_view.create_new:
+            try:
+                event_channel = await interaction.guild.create_stage_channel("Song Wars Stage")
+            except discord.Forbidden:
+                await interaction.followup.send(embed=e_error("I don't have permission to create a stage channel."))
+                return
+        elif vc_view.selected_channel:
+            event_channel = vc_view.selected_channel
+        else:
+            await interaction.followup.send(embed=e_error("No channel selected. Run `/startround` again."))
+            return
+
+        # Save event VC to state so scoring can find it
+        event_id = await db.create_event(interaction.guild.id, "Song Wars Round", "standard")
         state["active_song"] = None
         state["judge_dm_messages"] = {}
+        state["event_vc_id"] = event_channel.id
 
-        channel = interaction.guild.get_channel(SUBMISSIONS_CHANNEL)
+        channel = await get_submissions_channel(interaction.guild)
         if channel:
             embed = discord.Embed(
                 title="Song Wars: Submissions Open",
-                description="Submit your song using `/submit` or by DMing the bot your file directly.\nOne submission per person.",
+                description=f"Submit your song using `/submit` or by DMing the bot your file directly.\nOne submission per person.\n\nEvent channel: {event_channel.mention}",
                 color=C_INFO,
             )
             await channel.send(embed=embed)
 
-        await interaction.response.send_message(embed=e_success("Round opened."))
+        await interaction.followup.send(embed=e_success(f"Round opened. Event channel: {event_channel.mention}"))
 
     # ── /endround ─────────────────────────────────────────────────────────────
 
     @app_commands.command(name="endround", description="Close submissions for the current round.")
     @app_commands.guilds(guild_obj)
     async def endround(self, interaction: discord.Interaction):
-        if not self.is_host(interaction):
+        if not await self.is_host(interaction):
             await interaction.response.send_message(embed=e_error("Hosts only."))
             return
         event = await db.get_active_event(interaction.guild.id)
@@ -119,6 +195,7 @@ class Rounds(commands.Cog):
 
         subs = await db.get_all_submissions(event["id"])
         await db.close_event(event["id"])
+        state["event_vc_id"] = None
         await interaction.response.send_message(
             embed=e_success(f"Submissions closed. **{len(subs)}** song(s) received."),
         )
@@ -129,9 +206,11 @@ class Rounds(commands.Cog):
     @app_commands.describe(song="Your audio file (.mp3, .wav, .flac, .ogg, .m4a)")
     @app_commands.guilds(guild_obj)
     async def submit(self, interaction: discord.Interaction, song: discord.Attachment):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        channel_id = settings["submissions_channel_id"] if settings else 0
         await handle_submission(
             interaction.user, interaction.guild, song,
-            SUBMISSIONS_CHANNEL, interaction=interaction,
+            channel_id, interaction=interaction,
         )
 
     # ── /score ────────────────────────────────────────────────────────────────
@@ -139,7 +218,7 @@ class Rounds(commands.Cog):
     @app_commands.command(name="score", description="Score the next song in the queue.")
     @app_commands.guilds(guild_obj)
     async def score(self, interaction: discord.Interaction):
-        if not self.is_host(interaction):
+        if not await self.is_host(interaction):
             await interaction.response.send_message(embed=e_error("Hosts only."))
             return
         if state["active_song"]:
@@ -161,9 +240,7 @@ class Rounds(commands.Cog):
 
         submission = await db.get_next_unscored_submission(event["id"])
         if not submission:
-            await interaction.response.send_message(
-                embed=e_success("All songs have been scored.")
-            )
+            await interaction.response.send_message(embed=e_success("All songs have been scored."))
             return
 
         judge_ids = await db.get_judges(event["id"])
@@ -173,20 +250,35 @@ class Rounds(commands.Cog):
             )
             return
 
-        if not get_judges_in_vc(interaction.guild, judge_ids, EVENT_VC_ID):
+        # Get VC from active voice states - find VC with most judges in it
+        vc_id = await self._find_event_vc(interaction.guild, judge_ids)
+        if not vc_id:
             await interaction.response.send_message(
-                embed=e_error("No judges found in the event VC."),
+                embed=e_error("No judges found in any voice channel."),
             )
             return
 
         state["active_song"] = submission
-        count = await send_scoring_to_judges(interaction.guild, submission, judge_ids, EVENT_VC_ID)
+        count = await send_scoring_to_judges(interaction.guild, submission, judge_ids, vc_id)
 
         owner = interaction.guild.get_member(submission["user_id"])
         name = owner.display_name if owner else submission["username"]
         await interaction.response.send_message(
             embed=e_success(f"Scoring **{name}**'s song. Sent to {count} judge(s)."),
         )
+
+    async def _find_event_vc(self, guild: discord.Guild, judge_ids: list[int]) -> int | None:
+        """Use the saved event VC from state, or fall back to finding VC with most judges."""
+        if state.get("event_vc_id"):
+            return state["event_vc_id"]
+        best_vc = None
+        best_count = 0
+        for vc in guild.voice_channels:
+            count = sum(1 for m in vc.members if m.id in judge_ids)
+            if count > best_count:
+                best_count = count
+                best_vc = vc.id
+        return best_vc
 
     # ── /submissions ──────────────────────────────────────────────────────────
 
@@ -197,12 +289,10 @@ class Rounds(commands.Cog):
         if not event:
             await interaction.response.send_message(embed=e_error("No active round."))
             return
-
         subs = await db.get_all_submissions(event["id"])
         if not subs:
             await interaction.response.send_message(embed=e_info("No submissions yet."))
             return
-
         lines = "\n".join(
             f"{i}. <@{s['user_id']}> `{s['filename']}` {'[scored]' if s['scored'] else '[pending]'}"
             for i, s in enumerate(subs, 1)
@@ -224,13 +314,15 @@ class Rounds(commands.Cog):
             return
 
         user = message.author
+        settings = await db.get_guild_settings(guild.id)
+        channel_id = settings["submissions_channel_id"] if settings else 0
 
         # File → submission attempt
         if message.attachments:
             att = message.attachments[0]
             ext = Path(att.filename).suffix.lower()
             if ext in ALLOWED_EXT:
-                await handle_submission(user, guild, att, SUBMISSIONS_CHANNEL, dm_channel=message.channel)
+                await handle_submission(user, guild, att, channel_id, dm_channel=message.channel)
             else:
                 await message.channel.send(
                     embed=e_error(f"That file type isn't supported. Send an audio file: {', '.join(sorted(ALLOWED_EXT))}")
@@ -262,9 +354,10 @@ class Rounds(commands.Cog):
             return
 
         judge_ids = await db.get_judges(event["id"])
-        if user.id not in [j.id for j in get_judges_in_vc(guild, judge_ids, EVENT_VC_ID)]:
+        vc_id = await self._find_event_vc(guild, judge_ids)
+        if not vc_id or user.id not in [j.id for j in get_judges_in_vc(guild, judge_ids, vc_id)]:
             await message.channel.send(
-                embed=e_error("You need to be in the event voice channel to submit a score.")
+                embed=e_error("You need to be in a voice channel with other judges to submit a score.")
             )
             return
 
